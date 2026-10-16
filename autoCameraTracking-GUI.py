@@ -39,7 +39,7 @@ try:
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
         QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
         QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-        QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox,
+        QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter,
         QVBoxLayout, QWidget,
     )
 except ImportError:
@@ -62,7 +62,8 @@ COLMAP_TAG = "4.2.1"  # keep in sync with the default in BUILD_SCRIPT
 CUDA_NVCC = Path("/opt/cuda/bin/nvcc")
 # Where "Set up…" keeps COLMAP: src/ (source + build), colmap/ (installed COLMAP) and build_colmap.sh.
 DEFAULT_BASE = Path.home() / "AutoTracker"   # same place as before (a folder picked earlier still wins)
-MIN_FREE_FOR_BUILD = 3 * 1024 ** 3   # source + CUDA build + install, with headroom
+MIN_FREE_FOR_BUILD = 5 * 1024 ** 3   # sources + CUDA builds + cuDSS + install, with headroom
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")   # terminal colour codes in COLMAP's log output
 
 
 def self_built_colmap(base):
@@ -90,8 +91,14 @@ BUILD_SCRIPT = r'''#!/usr/bin/env bash
 #   SRC_DIR     source + build folders         (default $AUTOTRACKER_DIR/src/colmap)
 #   PREFIX      install location               (default $AUTOTRACKER_DIR/colmap)
 #   CUDA        ON / OFF                       (default ON)
+#   CERES_GPU   ON / OFF: GPU bundle adjustment (Ceres + cuDSS)  (default: same as CUDA)
 #   CUDA_ARCH   GPU architecture               (default native = the GPU in this PC)
 #   JOBS        parallel compile jobs          (default: all CPU threads)
+#
+# GPU bundle adjustment: the repo's ceres-solver has no CUDA, so COLMAP's final solve step
+# would run on the CPU. With CERES_GPU=ON, Ceres is built from its official source (pinned
+# commit; cuDSS support isn't in a Ceres release yet) together with NVIDIA's cuDSS library
+# (closed-source, downloaded from NVIDIA and checked against NVIDIA's published SHA256).
 # =============================================================================
 set -euo pipefail
 
@@ -99,8 +106,9 @@ AUTOTRACKER_DIR="${AUTOTRACKER_DIR:-$HOME/AutoTracker}"
 COLMAP_TAG="${COLMAP_TAG:-4.2.1}"
 SRC_DIR="${SRC_DIR:-$AUTOTRACKER_DIR/src/colmap}"
 PREFIX="${PREFIX:-$AUTOTRACKER_DIR/colmap}"
-MIN_FREE_GB=3   # source + CUDA build + install, with headroom
+MIN_FREE_GB=5   # sources + CUDA builds + cuDSS + install, with headroom
 CUDA="${CUDA:-ON}"
+CERES_GPU="${CERES_GPU:-$CUDA}"
 CUDA_ARCH="${CUDA_ARCH:-native}"
 JOBS="${JOBS:-$(nproc)}"
 BUILD_DIR="$SRC_DIR/build-$COLMAP_TAG"   # one build folder per release: nothing needs deleting
@@ -113,6 +121,15 @@ GKLIB_COMMIT="3b7d61b9f885063c89901f3901fb4426f9cfb58f"   # GKlib has no release
 DEPS="$PREFIX/deps"
 DEPS_SRC="$SRC_DIR-deps"
 BUILD_METIS=0
+
+# GPU bundle adjustment (CERES_GPU=ON)
+CERES_COMMIT="dd4199f718d27cf92eaf259ce52dca0abd0b9626"   # ceres-solver master, 2026-10-10 (has cuDSS)
+CERES_INSTALL="$DEPS/ceres"
+CUDSS_VERSION="0.8.0.10"
+CUDSS_URL="https://developer.download.nvidia.com/compute/cudss/redist/libcudss/linux-x86_64"
+CUDSS_SHA256_12="29716a05c64b28531309afcb7a9dd5044081a43197e72bdd0fbf29e9b4ee4707"   # from NVIDIA's
+CUDSS_SHA256_13="ba18f5fd80dcbbe905d158caac5b3061d848442bb5abd477b5f296b4257a4937"   # redistrib_0.8.0.json
+CUDSS_DIR="$DEPS/cudss"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 die()  { printf '\n\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -138,6 +155,9 @@ PKGS=(base-devel git cmake ninja boost boost-libs eigen openimageio metis google
       ceres-solver suitesparse cgal glew sqlite curl openssl qt6-base qt6-svg blas lapack ffmpeg)
 if [ "$CUDA" = ON ] && [ ! -x /opt/cuda/bin/nvcc ]; then
     PKGS+=(cuda)
+fi
+if [ "$CUDA" = ON ] && [ "$CERES_GPU" = ON ]; then
+    PKGS+=(abseil-cpp)   # the Ceres version with cuDSS uses abseil
 fi
 # pacman -T lists only what isn't satisfied yet (it understands "provides", e.g. openblas for blas)
 mapfile -t MISSING < <(pacman -T "${PKGS[@]}" || true)
@@ -170,6 +190,21 @@ fi
 if [ "$CUDA" = ON ] && [ ! -x /opt/cuda/bin/nvcc ]; then
     die "CUDA=ON but /opt/cuda/bin/nvcc is missing. Install 'cuda', or re-run with: env CUDA=OFF ./build_colmap.sh"
 fi
+[ "$CUDA" = ON ] || CERES_GPU=OFF
+BUILD_CERES=0
+if [ "$CERES_GPU" = ON ]; then
+    CUDA_MAJOR="$(/opt/cuda/bin/nvcc --version | sed -nE 's/.*release ([0-9]+)\..*/\1/p')"
+    case "$CUDA_MAJOR" in
+        12) CUDSS_SHA256="$CUDSS_SHA256_12" ;;
+        13) CUDSS_SHA256="$CUDSS_SHA256_13" ;;
+        *)  die "cuDSS $CUDSS_VERSION is available for CUDA 12 and 13, but nvcc reports CUDA '$CUDA_MAJOR'. Re-run with: env CERES_GPU=OFF ./build_colmap.sh" ;;
+    esac
+    CUDSS_FILE="libcudss-linux-x86_64-${CUDSS_VERSION}_cuda${CUDA_MAJOR}-archive.tar.xz"
+    CERES_STAMP="$CERES_COMMIT cudss-$CUDSS_VERSION cuda$CUDA_MAJOR"
+    if [ "$(cat "$CERES_INSTALL/.autotracker-ceres" 2>/dev/null || true)" != "$CERES_STAMP" ]; then
+        BUILD_CERES=1
+    fi
+fi
 
 # -----------------------------------------------------------------------------
 step "2/5  Download sources"
@@ -200,6 +235,32 @@ if [ "$BUILD_METIS" = 1 ]; then
     fi
 fi
 
+if [ "$BUILD_CERES" = 1 ]; then
+    echo "Ceres ${CERES_COMMIT:0:12}  ->  $DEPS_SRC/ceres"
+    mkdir -p "$DEPS_SRC"
+    if [ ! -d "$DEPS_SRC/ceres/.git" ]; then
+        git init -q "$DEPS_SRC/ceres"
+    fi
+    if [ "$(git -C "$DEPS_SRC/ceres" rev-parse -q --verify HEAD 2>/dev/null || true)" != "$CERES_COMMIT" ]; then
+        git -C "$DEPS_SRC/ceres" fetch -q --depth 1 https://github.com/ceres-solver/ceres-solver.git "$CERES_COMMIT"
+        git -C "$DEPS_SRC/ceres" -c advice.detachedHead=false checkout -q FETCH_HEAD
+    fi
+
+    echo "cuDSS $CUDSS_VERSION (CUDA $CUDA_MAJOR)  ->  $CUDSS_DIR"
+    DL="$DEPS_SRC/downloads"
+    mkdir -p "$DL"
+    if [ ! -f "$DL/$CUDSS_FILE" ] || ! echo "$CUDSS_SHA256  $DL/$CUDSS_FILE" | sha256sum -c --quiet - 2>/dev/null; then
+        curl -fL --progress-bar -o "$DL/$CUDSS_FILE.part" "$CUDSS_URL/$CUDSS_FILE" \
+            || die "Downloading cuDSS failed: $CUDSS_URL/$CUDSS_FILE"
+        mv "$DL/$CUDSS_FILE.part" "$DL/$CUDSS_FILE"
+    fi
+    echo "$CUDSS_SHA256  $DL/$CUDSS_FILE" | sha256sum -c --quiet - \
+        || die "cuDSS download does not match NVIDIA's published SHA256. Not using it. ($DL/$CUDSS_FILE)"
+    echo "    SHA256 OK (matches NVIDIA's published checksum)"
+    mkdir -p "$CUDSS_DIR"
+    tar -xJf "$DL/$CUDSS_FILE" -C "$CUDSS_DIR" --strip-components=1
+fi
+
 # -----------------------------------------------------------------------------
 step "3/5  Review before building"
 echo "Release:    COLMAP $COLMAP_TAG   (commit $COMMIT, from $REPO)"
@@ -220,6 +281,16 @@ if [ "$BUILD_METIS" = 1 ]; then
     echo "    cd $DEPS_SRC/GKlib && make config cc=gcc prefix=$DEPS && make && make install"
     echo "    cd $DEPS_SRC/METIS && make config cc=gcc prefix=$DEPS gklib_path=$DEPS && make && make install"
     echo "    (with CFLAGS=\"-O2 -fPIC -std=gnu17\" and CMAKE_POLICY_VERSION_MINIMUM=3.5)"
+fi
+if [ "$BUILD_CERES" = 1 ]; then
+    AUDIT+=("$DEPS_SRC/ceres    (Ceres commit $CERES_COMMIT, https://github.com/ceres-solver/ceres-solver)")
+    echo
+    echo "GPU bundle adjustment:"
+    echo "  Ceres is built from source with CUDA + cuDSS (the repo's ceres-solver has neither)."
+    echo "  cuDSS is NVIDIA's closed-source library, so there is no source to review. It came from"
+    echo "    $CUDSS_URL/$CUDSS_FILE"
+    echo "  and matches NVIDIA's published SHA256 ($CUDSS_SHA256)."
+    echo "  Unpacked to $CUDSS_DIR   (license: $CUDSS_DIR/LICENSE.txt)"
 fi
 echo
 echo "Everything that will be compiled is downloaded now and sits in these folders, ready to review:"
@@ -248,18 +319,6 @@ if [ "$BUILD_METIS" = 1 ]; then
     echo "METIS OK."
 fi
 
-CMAKE_ARGS=(-S "$SRC_DIR" -B "$BUILD_DIR" -G Ninja
-            -DCMAKE_BUILD_TYPE=Release
-            -DCMAKE_INSTALL_PREFIX="$PREFIX"
-            -DONNX_ENABLED=OFF
-            -DTESTS_ENABLED=OFF
-            -DCCACHE_ENABLED=OFF   # ccache would keep a cache in ~/.cache; keep everything in one folder
-            -DGUI_ENABLED=ON)
-if [ -f "$DEPS/lib/libmetis.a" ]; then
-    CMAKE_ARGS+=(-DCMAKE_PREFIX_PATH="$DEPS"
-                 -DMETIS_INCLUDE_DIR_HINTS="$DEPS/include"
-                 -DMETIS_LIBRARY_DIR_HINTS="$DEPS/lib")
-fi
 if [ "$CUDA" = ON ]; then
     export CUDACXX=/opt/cuda/bin/nvcc
     # Arch's cuda package links the GCC that nvcc officially supports as /opt/cuda/bin/g++.
@@ -268,6 +327,67 @@ if [ "$CUDA" = ON ]; then
         CUDAHOSTCXX="$(readlink -f /opt/cuda/bin/g++)"
         export CUDAHOSTCXX
     fi
+fi
+
+if [ "$BUILD_CERES" = 1 ]; then
+    CERES_LOG="$DEPS_SRC/ceres-build.log"
+    CERES_BUILD="$DEPS_SRC/ceres/build"
+    echo "Building Ceres with CUDA + cuDSS (static) -> $CERES_INSTALL   (log: $CERES_LOG)"
+    if ! cmake -S "$DEPS_SRC/ceres" -B "$CERES_BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$CERES_INSTALL" \
+            -DCMAKE_PREFIX_PATH="$CUDSS_DIR" \
+            -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+            -DWITH_CUDA=default -DWITH_SUITESPARSE=ON \
+            -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF \
+            > "$CERES_LOG" 2>&1; then
+        tail -n 30 "$CERES_LOG"
+        die "Configuring Ceres failed. Full log: $CERES_LOG"
+    fi
+    # Don't build a Ceres that would still fall back to the CPU: check it really got CUDA + cuDSS.
+    CFG_H="$CERES_BUILD/include/ceres/internal/config.h"
+    if grep -q '^#define CERES_NO_CUDA$' "$CFG_H"; then
+        die "Ceres didn't enable CUDA (see $CERES_LOG). Nothing was built."
+    fi
+    if grep -q '^#define CERES_NO_CUDSS$' "$CFG_H"; then
+        grep -iE 'cudss' "$CERES_LOG" | head -5
+        die "Ceres didn't find cuDSS in $CUDSS_DIR (see $CERES_LOG). Nothing was built."
+    fi
+    echo "    CUDA: ON, cuDSS: ON"
+    if ! { ninja -C "$CERES_BUILD" -j "$JOBS" && ninja -C "$CERES_BUILD" install; } >> "$CERES_LOG" 2>&1; then
+        tail -n 30 "$CERES_LOG"
+        die "Building Ceres failed. Full log: $CERES_LOG"
+    fi
+    echo "$CERES_STAMP" > "$CERES_INSTALL/.autotracker-ceres"
+    echo "Ceres OK."
+fi
+
+CMAKE_ARGS=(-S "$SRC_DIR" -B "$BUILD_DIR" -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX="$PREFIX"
+            -DONNX_ENABLED=OFF
+            -DTESTS_ENABLED=OFF
+            -DCCACHE_ENABLED=OFF   # ccache would keep a cache in ~/.cache; keep everything in one folder
+            -DGUI_ENABLED=ON)
+PREFIX_PATHS=()
+if [ -f "$DEPS/lib/libmetis.a" ]; then
+    PREFIX_PATHS+=("$DEPS")
+    CMAKE_ARGS+=(-DMETIS_INCLUDE_DIR_HINTS="$DEPS/include"
+                 -DMETIS_LIBRARY_DIR_HINTS="$DEPS/lib")
+fi
+CERES_CFG="$(find "$CERES_INSTALL" -name CeresConfig.cmake -print -quit 2>/dev/null || true)"
+if [ "$CERES_GPU" = ON ] && [ -n "$CERES_CFG" ]; then
+    PREFIX_PATHS+=("$CUDSS_DIR")
+    # use the GPU Ceres instead of the repo one, and let colmap find libcudss.so at runtime
+    CMAKE_ARGS+=(-DCeres_DIR="$(dirname "$CERES_CFG")"
+                 -DCMAKE_INSTALL_RPATH="$CUDSS_DIR/lib"
+                 -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON)
+fi
+if [ "${#PREFIX_PATHS[@]}" -gt 0 ]; then
+    CMAKE_ARGS+=(-DCMAKE_PREFIX_PATH="$(IFS=';'; echo "${PREFIX_PATHS[*]}")")
+fi
+if [ "$CUDA" = ON ]; then
     CMAKE_ARGS+=(-DCUDA_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH")
 else
     CMAKE_ARGS+=(-DCUDA_ENABLED=OFF)
@@ -294,6 +414,15 @@ if "$BIN" help 2>&1 | grep -q global_mapper; then
     echo "OK: global_mapper (the GLOMAP solver) is available."
 else
     echo "WARNING: global_mapper not found in this build."
+fi
+if [ "$CERES_GPU" = ON ]; then
+    if ldd "$BIN" | grep -q 'libcudss.*=> /'; then
+        echo "OK: GPU bundle adjustment (Ceres + cuDSS) is linked in."
+        echo "$CERES_COMMIT cudss-$CUDSS_VERSION" > "$PREFIX/.ceres-gpu"
+    else
+        echo "WARNING: colmap isn't linked against cuDSS; bundle adjustment will still run on the CPU."
+        ldd "$BIN" | grep -iE 'cudss|not found' || true
+    fi
 fi
 echo
 echo "Installed: $BIN"
@@ -458,6 +587,11 @@ def setup_plan(t):
     elif t.cuda is False and CUDA_NVCC.exists():
         reason = ("Optional: your COLMAP was built without CUDA, so feature extraction runs on the CPU "
                   "(slow). You have the CUDA toolkit, so rebuilding with CUDA is recommended.")
+    elif (getattr(t, "managed", False) and t.cuda and not getattr(t, "ceres_gpu", False)
+          and CUDA_NVCC.exists()):
+        reason = ("Recommended: bundle adjustment (the final solve step) runs on the CPU, because the "
+                  "ceres-solver from the repos has no GPU support. Set up rebuilds Ceres with CUDA + cuDSS "
+                  "and relinks COLMAP, so that step runs on your GPU too.")
     else:
         reason = ""
     if reason:
@@ -654,7 +788,9 @@ class Main(QMainWindow):
         row = QHBoxLayout()
         self.btn_recheck = QPushButton("Re-check")
         self.btn_install = QPushButton("Set up…")
-        self.btn_install.setToolTip("Install ffmpeg / build COLMAP from source if something is missing")
+        self.btn_install.setToolTip("Install ffmpeg / build COLMAP from source if something is missing, "
+                                    "or add GPU bundle adjustment. Shows what it will do before anything runs.")
+        self.btn_recheck.setToolTip("Look for ffmpeg and COLMAP again (e.g. after installing something)")
         self.btn_recheck.clicked.connect(self.refresh_tools)
         self.btn_install.clicked.connect(self.show_install)
         row.addWidget(self.btn_recheck)
@@ -673,6 +809,7 @@ class Main(QMainWindow):
                                  "with its image sequence and camera solve")
         self.out_edit.textChanged.connect(self.update_summary)
         ob = QPushButton("Choose…")
+        ob.setToolTip("Pick the project folder. Image sequences and camera solves are saved inside it.")
         ob.clicked.connect(self.pick_output)
         orow.addWidget(self.out_edit, 1)
         orow.addWidget(ob)
@@ -686,7 +823,7 @@ class Main(QMainWindow):
         self.vlist.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.vlist.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         vl.addWidget(self.vlist)
-        vr = QHBoxLayout()
+        vr = QGridLayout()   # 2 x 2 so the buttons never squeeze the panel
         b1, b2, b3, b4 = (QPushButton(t) for t in
                           ("Add video files…", "Add all videos in a folder…", "Remove selected", "Clear list"))
         b1.setToolTip("Pick one or more video files")
@@ -697,9 +834,10 @@ class Main(QMainWindow):
         b2.clicked.connect(self.add_folder)
         b3.clicked.connect(self.vlist.remove_selected)
         b4.clicked.connect(lambda: (self.vlist.clear(), self.update_summary()))
-        for b in (b1, b2, b3, b4):
-            vr.addWidget(b)
-        vr.addStretch(1)
+        vr.addWidget(b1, 0, 0)
+        vr.addWidget(b2, 0, 1)
+        vr.addWidget(b3, 1, 0)
+        vr.addWidget(b4, 1, 1)
         vl.addLayout(vr)
         tip = QLabel("Your videos are only read: nothing is copied or moved.")
         tip.setWordWrap(True)
@@ -737,6 +875,8 @@ class Main(QMainWindow):
         self.overlap_spin.setValue(15)
         self.overlap_spin.setToolTip("How many neighbouring frames each frame is matched against (original: 15).")
         self.chk_gpu = QCheckBox("Use GPU (CUDA) for features and matching")
+        self.chk_gpu.setToolTip("Run feature detection and matching on your NVIDIA GPU (much faster). "
+                                "Untick only if it fails.")
         form.addRow("Extract at:", self.fps_spin)
         form.addRow("Frame width:", self.width_spin)
         form.addRow("Frame quality:", self.quality)
@@ -752,10 +892,15 @@ class Main(QMainWindow):
         self.chk_del_frames.setToolTip("The solved camera/points (sparse/) are kept. If your Blender import "
                                        "uses the frames as a background, use the original video there instead.")
         self.chk_del_db = QCheckBox("Delete the COLMAP database when a video is finished")
+        self.chk_skip.setToolTip("Videos that already have a camera solve in the project folder are not redone")
+        self.chk_del_db.setToolTip("database.db holds COLMAP's features and matches (often hundreds of MB). "
+                                   "Not needed for Blender; only for re-running COLMAP steps by hand.")
         sl.addWidget(self.chk_skip)
         sl.addWidget(self.chk_del_frames)
         sl.addWidget(self.chk_del_db)
         self.btn_estimate = QPushButton("Estimate disk use")
+        self.btn_estimate.setToolTip("Work out how much space the listed videos will need with these settings "
+                                     "(samples one frame per video)")
         self.btn_estimate.clicked.connect(lambda: self.estimate(show=True))
         sl.addWidget(self.btn_estimate)
         self.est_label = QLabel()
@@ -772,7 +917,9 @@ class Main(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(self.controls)
-        scroll.setMinimumWidth(520)
+        # never narrower than its contents, so nothing on the left gets cut off
+        scroll.setMinimumWidth(self.controls.minimumSizeHint().width()
+                               + scroll.verticalScrollBar().sizeHint().width() + 2 * scroll.frameWidth() + 4)
 
         # ---- right: run + log
         right = QWidget()
@@ -785,6 +932,10 @@ class Main(QMainWindow):
         self.btn_cancel.clicked.connect(self.cancel)
         self.btn_open.clicked.connect(self.open_output)
         self.btn_cancel.setEnabled(False)
+        self.btn_start.setToolTip("Process every video in the list: extract frames, find and match features, "
+                                  "solve the camera, export for Blender")
+        self.btn_cancel.setToolTip("Stop the current run. The video being processed is redone next time.")
+        self.btn_open.setToolTip("Open the project folder in your file manager")
         rr.addWidget(self.btn_start)
         rr.addWidget(self.btn_cancel)
         rr.addStretch(1)
@@ -801,11 +952,18 @@ class Main(QMainWindow):
         rl.addWidget(self.status)
         rl.addWidget(self.log_box, 1)
 
-        central = QWidget()
-        lay = QHBoxLayout(central)
-        lay.addWidget(scroll, 5)
-        lay.addWidget(right, 6)
-        self.setCentralWidget(central)
+        # draggable divider between the settings (left) and the log (right)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(scroll)
+        self.splitter.addWidget(right)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 1)
+        right.setMinimumWidth(320)
+        self.setCentralWidget(self.splitter)
+        left_w = max(scroll.minimumWidth(), 640)
+        self.resize(max(1200, left_w + 560), 860)
+        self.splitter.setSizes([left_w, self.width() - left_w])
 
     # ------------------------------------------------------------------ settings
     def _load_settings(self):
@@ -820,6 +978,12 @@ class Main(QMainWindow):
         self.chk_del_frames.setChecked(truthy(s.value("del_frames", False)))
         self.chk_del_db.setChecked(truthy(s.value("del_db", False)))
         self._gpu_saved = s.value("gpu", None)
+        st = s.value("splitter")
+        if st is not None:
+            try:
+                self.splitter.restoreState(st)   # where you last dragged the divider
+            except (TypeError, ValueError):
+                pass
         self.fps_spin.valueChanged.connect(self.update_summary)
 
     def _save_settings(self):
@@ -834,6 +998,7 @@ class Main(QMainWindow):
         s.setValue("skip", self.chk_skip.isChecked())
         s.setValue("del_frames", self.chk_del_frames.isChecked())
         s.setValue("del_db", self.chk_del_db.isChecked())
+        s.setValue("splitter", self.splitter.saveState())
 
     def closeEvent(self, e):
         if self.running:
@@ -873,6 +1038,9 @@ class Main(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         t = self.tools
+        # built by Set up? and with GPU bundle adjustment (Ceres + cuDSS)?
+        t.managed = bool(t.colmap) and Path(t.colmap) in self.colmap_locations()
+        t.ceres_gpu = t.managed and (Path(t.colmap).parent.parent / ".ceres-gpu").exists()
         ok, bad = '<span style="color:#3aa35f">✓</span>', '<span style="color:#d9534f">✗</span>'
         warn = '<span style="color:#d9a13a">⚠</span>'
 
@@ -885,9 +1053,12 @@ class Main(QMainWindow):
             cu = {True: f"{ok} {getattr(t, 'gpu_kind', '') or 'CUDA'}",
                   False: f"{warn} no GPU support (slow CPU features)",
                   None: "GPU support unknown"}[t.cuda]
-            where = (" <i>(built by Set up…)</i>" if Path(t.colmap) in self.colmap_locations()
-                     else custom("colmap"))
-            self.dep["colmap"].setText(f"{ok} {t.version or 'found'} · {cu}<br><small>{t.colmap}"
+            where = " <i>(built by Set up…)</i>" if t.managed else custom("colmap")
+            ba = ""
+            if t.cuda and t.managed:
+                ba = (f" · {ok} GPU bundle adjustment" if t.ceres_gpu else
+                      f" · {warn} bundle adjustment on CPU — <b>Set up…</b> adds GPU")
+            self.dep["colmap"].setText(f"{ok} {t.version or 'found'} · {cu}{ba}<br><small>{t.colmap}"
                                        f"{where}</small>")
         else:
             self.dep["colmap"].setText(f"{bad} not found — click <b>Set up…</b>")
@@ -904,7 +1075,8 @@ class Main(QMainWindow):
         if not self._gpu_init_done:  # only pick a default on first check; never override the user afterwards
             self._gpu_init_done = True
             self.chk_gpu.setChecked(t.cuda is not False if self._gpu_saved is None else truthy(self._gpu_saved))
-        self.chk_gpu.setToolTip("" if t.cuda is not False else
+        self.chk_gpu.setToolTip("Run feature detection and matching on your NVIDIA GPU (much faster). "
+                                "Untick only if it fails." if t.cuda is not False else
                                 "Your COLMAP reports no CUDA. GPU SIFT will probably fail — uncheck if it does.")
         for p in self.vlist.paths():
             self.meta.pop(p, None)
@@ -933,6 +1105,9 @@ class Main(QMainWindow):
                 plan["reason"], "",
                 f"Set up will build COLMAP {COLMAP_TAG} from the official source, {cuda}.",
                 "COLMAP 4 already includes the GLOMAP solver, so there is nothing else to build.",
+                "For GPU bundle adjustment it also builds Ceres (the solver) with CUDA + cuDSS.",
+                "cuDSS is NVIDIA's closed-source library: downloaded from NVIDIA and checked against",
+                "NVIDIA's published SHA256 before use. If COLMAP is already built, it's only relinked.",
                 "", f"COLMAP is built and installed in {base}  (about {fmt_bytes(MIN_FREE_FOR_BUILD)}; "
                 "delete that folder to uninstall).",
             ]
@@ -981,6 +1156,7 @@ class Main(QMainWindow):
         row = QHBoxLayout()
         if script_path:
             b_view = QPushButton("View script")
+            b_view.setToolTip("Open the setup script in your text editor so you can read all of it first")
             b_view.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(script_path))))
             row.addWidget(b_view)
         row.addStretch(1)
@@ -989,9 +1165,12 @@ class Main(QMainWindow):
             b_copy.clicked.connect(lambda: QApplication.clipboard().setText(plan["cmd"]))
             b_run.clicked.connect(lambda: (self.run_in_terminal(plan["cmd"]), dlg.accept()))
             b_run.setDefault(True)
+            b_copy.setToolTip("Copy the command, to run it in your own terminal instead")
+            b_run.setToolTip("Open a terminal and run it there (you type your sudo password in that window)")
             row.addWidget(b_copy)
             row.addWidget(b_run)
         b_close = QPushButton("Close")
+        b_close.setToolTip("Close without running anything")
         b_close.clicked.connect(dlg.reject)
         row.addWidget(b_close)
         lay.addLayout(row)
@@ -1347,7 +1526,7 @@ class Main(QMainWindow):
             self.handle_line(line)
 
     def handle_line(self, line):
-        line = line.rstrip()
+        line = ANSI_RE.sub("", line).rstrip()
         if not line:
             return
         if self.cur_kind == "ffmpeg" and FFMPEG_PROGRESS_RE.match(line):
